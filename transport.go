@@ -1,0 +1,270 @@
+package faas
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// safeLogField strips ASCII line breaks from a request-supplied
+// string before it lands in a log line. CodeQL's go/log-injection
+// rule explicitly lists strings.ReplaceAll as a recognised
+// sanitiser (its help text shows the canonical pattern: replace
+// "\r" and "\n" before logging); we follow that shape so the
+// alert auto-closes. We also cap at 1 KiB so a hostile URL with
+// a multi-MB query string doesn't turn into a multi-MB log entry.
+// Slog's JSON handler renders the result as a plain JSON object
+// field (no quotes around the value), so downstream observers see
+// the URL with CRLF silently dropped — the right contract for
+// transport logging.
+//
+// Used by loggingRoundTripper before passing req.Method and
+// req.URL.String() to slog.Debug. Both fields are user-controlled
+// at the HTTP layer (the server can accept arbitrary request
+// lines on untrusted ingress), so the sanitiser is required, not
+// optional. References: memory codeql-go-log-injection-sanitisers
+// (the same fix at pkg/gateway/forwardproxy.go:88).
+func safeLogField(s string) string {
+	const max = 1024
+	if len(s) > max {
+		s = s[:max] + "…"
+	}
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\n", "")
+	return s
+}
+
+// loggingRoundTripper wraps an http.RoundTripper, emitting one
+// slog.Debug line per request/response. nil log is a true no-op
+// (the constructor returns the inner Transport identity so the
+// stack is observably identical to a non-wrapped chain).
+//
+// The slog calls are intentionally simple — a single struct of
+// key/value pairs (method, url, status, elapsed_ms, error). This
+// matches the convention other cloud SDKs use (cloudflare-go,
+// AWS SDK v2). PII redaction is the caller's job; the SDK does
+// not log request/response bodies.
+type loggingRoundTripper struct {
+	next http.RoundTripper
+	log  *slog.Logger
+}
+
+// newLoggingRoundTripper returns an http.RoundTripper that logs
+// each attempt. If log is nil, next is returned unchanged so the
+// wrapper is observably a no-op (no log allocations, no stack
+// frame on hot path).
+func newLoggingRoundTripper(next http.RoundTripper, log *slog.Logger) http.RoundTripper {
+	if log == nil {
+		return next
+	}
+	return &loggingRoundTripper{next: next, log: log}
+}
+
+func (l *loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := time.Now()
+	method := safeLogField(req.Method)
+	url := safeLogField(req.URL.String())
+	l.log.Debug("faas http request",
+		"method", method,
+		"url", url,
+	)
+	resp, err := l.next.RoundTrip(req)
+	elapsed := time.Since(start)
+	if err != nil {
+		l.log.Debug("faas http response",
+			"method", method,
+			"url", url,
+			"error", err.Error(),
+			"elapsed_ms", elapsed.Milliseconds(),
+		)
+		return resp, err
+	}
+	l.log.Debug("faas http response",
+		"method", method,
+		"url", url,
+		"status", resp.StatusCode,
+		"elapsed_ms", elapsed.Milliseconds(),
+	)
+	return resp, nil
+}
+
+// retryRoundTripper retries on 5xx and 429 with bounded
+// exponential backoff. It also retries a traffic policy check that
+// ran out of time (422 traffic_policy_too_complex with Retry-After):
+// the refusal saved nothing and asks to be resent. It does NOT retry
+// on other 4xx (the server is telling us the request is wrong;
+// retrying won't help) or on network errors (those bubble up immediately so
+// the caller's context cancellation / deadline takes effect).
+//
+// Body rewind: net/http populates req.GetBody for all
+// http.NewRequestWithContext-created requests (the SDK uses
+// http.NewRequestWithContext in doReq). On retry, we rewind
+// via GetBody so the body is replayable. For requests without
+// GetBody, one-shot bodies are sent once.
+//
+// max <= 0 is a no-op identity passthrough (matches
+// loggingRoundTripper's nil-log behavior: the option is
+// opt-in).
+type retryRoundTripper struct {
+	next    http.RoundTripper
+	max     int
+	backoff time.Duration
+}
+
+// newRetryRoundTripper returns an http.RoundTripper that retries
+// on 5xx and 429 up to max times with exponential backoff
+// (backoff, 2*backoff, 4*backoff, ...). If max <= 0, next is
+// returned unchanged.
+func newRetryRoundTripper(next http.RoundTripper, max int, backoff time.Duration) http.RoundTripper {
+	if max <= 0 {
+		return next
+	}
+	if backoff <= 0 {
+		backoff = 100 * time.Millisecond
+	}
+	return &retryRoundTripper{next: next, max: min(max, 8), backoff: min(backoff, 8*time.Second)}
+}
+
+func transportRetryDelay(base time.Duration, attempt int) time.Duration {
+	const cap = 8 * time.Second
+	for n := 1; n < attempt && base < cap; n++ {
+		if base > cap/2 {
+			return cap
+		}
+		base *= 2
+	}
+	return min(base, cap)
+}
+
+// RoundTrip is the http.RoundTripper contract. It loops up to
+// max+1 times (initial attempt + max retries), each time checking
+// the response and either returning success, returning a non-
+// retriable response, or sleeping with backoff before the next
+// attempt.
+//
+// The sleep is context-aware: a cancelled or expired request
+// context aborts the wait and returns the context error.
+func (r *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Outbox policy recovery owns retry scheduling and must see Retry-After.
+	if managed, _ := req.Context().Value(transportRetryContextKey{}).(bool); managed {
+		return r.next.RoundTrip(req)
+	}
+
+	// Session and URL capabilities are returned once. Repeating creation
+	// could leave inaccessible authority or another capacity reservation.
+	path := strings.TrimRight(req.URL.Path, "/")
+	if req.Method == http.MethodPost && (strings.HasSuffix(path, "/v1/dev/bridges") || strings.HasPrefix(path, "/v1/apps/") && strings.Contains(path, "/buckets/") && strings.HasSuffix(path, "/signed-url")) {
+		return r.next.RoundTrip(req)
+	}
+	var lastResp *http.Response
+	var retryAfter time.Duration
+	for attempt := 0; attempt <= r.max; attempt++ {
+		if err := req.Context().Err(); err != nil {
+			return nil, err
+		}
+		if attempt > 0 {
+			delay := max(transportRetryDelay(r.backoff, attempt), retryAfter)
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-req.Context().Done():
+				timer.Stop()
+				return nil, req.Context().Err()
+			}
+			// Rewind body for retry. GetBody is set by
+			// http.NewRequestWithContext (which the SDK uses)
+			// and by any caller that built a body explicitly.
+			if req.GetBody != nil {
+				body, err := req.GetBody()
+				if err != nil {
+					return lastResp, err
+				}
+				req.Body = body
+			}
+		}
+		resp, err := r.next.RoundTrip(req)
+		if err != nil {
+			// Network error — surface immediately. The SDK's
+			// outer context is the cancellation source; we
+			// don't try to retry a network blip.
+			return resp, err
+		}
+		lastResp = resp
+		// Retry on 5xx and 429, and on a timed-out policy check. Other
+		// 4xx are a client-side problem; the server is not going to
+		// change its mind on a retry. The last answer keeps its body
+		// so the caller can decode the problem.
+		retryAfter = transportRetryAfter(resp.Header.Get("Retry-After"), time.Now())
+		if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+			wait, timedOut := policyCheckTimedOut(resp)
+			if !timedOut {
+				return resp, nil
+			}
+			retryAfter = wait
+		}
+		if attempt == r.max || req.Body != nil && req.Body != http.NoBody && req.GetBody == nil {
+			return resp, nil
+		}
+		// Drain + close before retrying so the connection can
+		// be reused (Go's http.Transport will close unclosed
+		// bodies, but explicit drain is friendlier and avoids
+		// a "body not drained" log line on retry).
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	return lastResp, nil
+}
+
+func transportRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
+		const maxDuration = time.Duration(1<<63 - 1)
+		if seconds > int64(maxDuration/time.Second) {
+			return maxDuration
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if date, err := http.ParseTime(value); err == nil {
+		return max(0, date.Sub(now))
+	}
+	return 0
+}
+
+// policyCheckTimedOut reports a 422 traffic_policy_too_complex that carries
+// Retry-After (the policy check ran out of time on a busy control plane) and
+// the wait it asks for. It reads at most 64 KiB of the body and puts it back.
+func policyCheckTimedOut(resp *http.Response) (time.Duration, bool) {
+	seconds, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After")))
+	if resp.StatusCode != http.StatusUnprocessableEntity || err != nil || seconds < 0 || resp.Body == nil {
+		return 0, false
+	}
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(data), resp.Body), resp.Body}
+	var problem struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal(data, &problem) != nil || problem.Code != "traffic_policy_too_complex" {
+		return 0, false
+	}
+	return min(time.Duration(seconds)*time.Second, 10*time.Second), true
+}
+
+// transportRetryContextKey marks a request whose caller owns retry
+// scheduling.
+type transportRetryContextKey struct{}
+
+// WithoutTransportRetry returns a context whose requests skip the client's
+// retry layer and see every Retry-After answer themselves. Event outbox
+// recovery (faas/preview) uses it to own its retry schedule.
+func WithoutTransportRetry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, transportRetryContextKey{}, true)
+}

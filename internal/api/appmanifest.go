@@ -1,0 +1,169 @@
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+)
+
+// AppManifestPath is where imaged writes the manifest inside the app layer and
+// where guest-init reads it at boot (spec §4.6, §4.8).
+const AppManifestPath = "/etc/faas/app.json"
+
+// Defaults for the guest runtime contract (spec §4.8, §4.9).
+const (
+	DefaultAppPort = 8080  // the :8080 contract
+	DefaultAppUser = "app" // uid 1000 inside the guest
+	DefaultAppUID  = 1000
+)
+
+// Execution modes and restart policies are part of the app lifecycle contract
+// exposed by the v1 API. Empty values preserve the request-driven defaults.
+const (
+	ExecutionModeRequest = "request"
+	ExecutionModeService = "service"
+	ExecutionModeWorker  = "worker"
+	ExecutionModeJob     = "job"
+
+	RestartPolicyNo            = "no"
+	RestartPolicyOnFailure     = "on-failure"
+	RestartPolicyAlways        = "always"
+	RestartPolicyUnlessStopped = "unless-stopped"
+)
+
+// ServiceReplicas is the desired-count policy for service-mode deployments.
+type ServiceReplicas struct {
+	Min     int `json:"min"`
+	Max     int `json:"max"`
+	Desired int `json:"desired"`
+}
+
+// AfterRestoreHook is a loopback callback required before a restored app is ready.
+type AfterRestoreHook struct {
+	Path      string `json:"path"`
+	TimeoutMS int    `json:"timeout_ms,omitempty"`
+}
+
+// BeforeCheckpointHook is a loopback callback required before terminal init capture.
+type BeforeCheckpointHook struct {
+	Path      string `json:"path"`
+	TimeoutMS int    `json:"timeout_ms,omitempty"`
+}
+
+// AppManifest is the /etc/faas/app.json contract: the single handoff from the
+// build/imaging side (imaged) to the guest side (guest-init). imaged writes it
+// into the app layer; guest-init applies env, execs the entrypoint as the app
+// user, and uses Port/Healthz for readiness. Keep this struct stable — it is a
+// cross-boundary contract baked into every snapshot.
+type AppManifest struct {
+	// Entrypoint is the exec argv for the customer app. Required.
+	Entrypoint []string `json:"entrypoint"`
+	// Env is applied before exec. Secret values are injected at boot, not stored
+	// here (spec gap G2) — never put secrets in the manifest.
+	Env map[string]string `json:"env,omitempty"`
+	// WorkingDir is the app's cwd; empty means "/".
+	WorkingDir string `json:"working_dir,omitempty"`
+	// Port is the readiness/serving port; 0 means DefaultAppPort.
+	Port int `json:"port,omitempty"`
+	// Healthz, if set, is a GET path guest-init probes for readiness instead of a
+	// bare TCP accept (spec §4.8).
+	Healthz string `json:"healthz,omitempty"`
+	// HealthPath is the monitor-facing edge health endpoint. Empty uses /healthz.
+	HealthPath string `json:"health_path,omitempty"`
+	// HealthPathWakes opts Pro/Scale apps into waking for health probes.
+	HealthPathWakes bool `json:"health_path_wakes,omitempty"`
+	// SessionAffinity enables best-effort routing to the same healthy instance.
+	SessionAffinity bool `json:"session_affinity,omitempty"`
+	// ServiceBindingTransport selects the injected service URL scheme. Empty
+	// preserves the legacy HTTP behavior.
+	ServiceBindingTransport ServiceBindingTransport `json:"service_binding_transport,omitempty"`
+	// User is the unix user to exec as; empty means DefaultAppUser.
+	User string `json:"user,omitempty"`
+	// SecretReloadSignal opts this workload into live secret projection refresh.
+	SecretReloadSignal string `json:"secret_reload_signal,omitempty"`
+	// SecretReloadReadiness waits for the workload's marker before signaling.
+	SecretReloadReadiness bool `json:"secret_reload_readiness,omitempty"`
+	// ExecutionMode selects request, replicated service, worker, or job
+	// lifecycle semantics. Empty preserves the request-driven default.
+	ExecutionMode string `json:"execution_mode,omitempty"`
+	// RestartPolicy controls supervisor restarts. Empty defers to the
+	// execution-mode default.
+	RestartPolicy    string                `json:"restart_policy,omitempty"`
+	AfterRestore     *AfterRestoreHook     `json:"after_restore,omitempty"`
+	BeforeCheckpoint *BeforeCheckpointHook `json:"before_checkpoint,omitempty"`
+	// Pause declares when the platform may pause the VM (ADR-1151):
+	// between_requests, when_idle or never. Empty selects the default.
+	Pause     string           `json:"pause,omitempty"`
+	Profiling *ProfilingConfig `json:"profiling,omitempty"`
+	Tracing   *TracingConfig   `json:"tracing,omitempty"`
+	// StartupDeadlineS is the time-to-ready bound. Zero uses the plan default.
+	StartupDeadlineS int `json:"startup_deadline_s,omitempty"`
+	// MaxRetries is the consecutive restart-attempt bound. Zero uses the plan
+	// default.
+	MaxRetries int `json:"max_retries,omitempty"`
+	// ServiceReplicas is honoured when ExecutionMode is service.
+	ServiceReplicas *ServiceReplicas `json:"service_replicas,omitempty"`
+}
+
+// EffectivePort returns Port or the default.
+func (m AppManifest) EffectivePort() int {
+	if m.Port == 0 {
+		return DefaultAppPort
+	}
+	return m.Port
+}
+
+// EffectiveUser returns User or the default.
+func (m AppManifest) EffectiveUser() string {
+	if m.User == "" {
+		return DefaultAppUser
+	}
+	return m.User
+}
+
+// EffectiveWorkingDir returns WorkingDir or "/".
+func (m AppManifest) EffectiveWorkingDir() string {
+	if m.WorkingDir == "" {
+		return "/"
+	}
+	return m.WorkingDir
+}
+
+// Validate rejects a manifest that guest-init could not act on.
+func (m AppManifest) Validate() error {
+	if len(m.Entrypoint) == 0 {
+		return fmt.Errorf("app manifest: empty entrypoint")
+	}
+	if m.Entrypoint[0] == "" {
+		return fmt.Errorf("app manifest: empty entrypoint[0]")
+	}
+	if m.Port < 0 || m.Port > 65535 {
+		return fmt.Errorf("app manifest: port %d out of range", m.Port)
+	}
+	if m.SecretReloadReadiness && m.SecretReloadSignal == "" {
+		return fmt.Errorf("app manifest: secret_reload_readiness requires secret_reload_signal")
+	}
+	if m.SecretReloadSignal != "" && m.SecretReloadSignal != "SIGHUP" && m.SecretReloadSignal != "SIGUSR1" && m.SecretReloadSignal != "SIGUSR2" {
+		return fmt.Errorf("app manifest: invalid secret_reload_signal %q", m.SecretReloadSignal)
+	}
+	return nil
+}
+
+// WriteManifest encodes m as canonical JSON.
+func WriteManifest(w io.Writer, m AppManifest) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(m)
+}
+
+// ReadManifest decodes and validates a manifest (guest-init's boot path).
+func ReadManifest(r io.Reader) (AppManifest, error) {
+	var m AppManifest
+	if err := json.NewDecoder(r).Decode(&m); err != nil {
+		return AppManifest{}, fmt.Errorf("app manifest: decode: %w", err)
+	}
+	if err := m.Validate(); err != nil {
+		return AppManifest{}, err
+	}
+	return m, nil
+}
